@@ -15,7 +15,7 @@
 # limitations under the License.
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -39,10 +39,17 @@ from lerobot.processor import (
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.core import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
+
+# New batch keys for hierarchical reasoning (training only). Hard-coded strings
+# to avoid touching upstream lerobot constants.
+OBS_LANGUAGE_AR_MASK = "observation.language.ar_mask"
+OBS_LANGUAGE_LOSS_MASK = "observation.language.loss_mask"
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -97,6 +104,119 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register(name="pi05_reasoning_prepare_and_tokenize_step")
+@dataclass
+class Pi05ReasoningPrepareAndTokenizeStep(ProcessorStep):
+    """Prepare state + tokenize a `Task: HL. Subtask: SUB. State: ...;\nAction: ` prompt.
+
+    Subsumes Pi05PrepareStateTokenizerProcessorStep + TokenizerProcessorStep for
+    the hierarchical-reasoning training path. Emits four batch tensors:
+
+      - OBS_LANGUAGE_TOKENS         : int64[B, max_length]  full prompt token ids
+      - OBS_LANGUAGE_ATTENTION_MASK : bool[B, max_length]   real vs padding
+      - OBS_LANGUAGE_AR_MASK        : bool[B, max_length]   per-token causal block start
+                                                            (1 at each subtask token + first tail token)
+      - OBS_LANGUAGE_LOSS_MASK      : bool[B, max_length]   per-token CE loss target
+                                                            (1 only at subtask tokens)
+
+    When the batch has no `reasoning` (e.g. inference before AR decode),
+    falls back to a subtask-empty prompt: `Task: HL. Subtask: <pad...>State: ...`
+    and zero ar/loss masks — modeling code is responsible for two-stage handling.
+    """
+
+    tokenizer_name: str = "google/paligemma-3b-pt-224"
+    max_length: int = 200
+    max_state_dim: int = 32
+    task_key: str = "task"
+    reasoning_key: str = "reasoning"
+    # Lazy-loaded tokenizer (not part of dataclass equality).
+    _tokenizer: Any = field(default=None, init=False, repr=False, compare=False)
+
+    def _get_tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
+        return self._tokenizer
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+
+        state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        if state is None:
+            raise ValueError("State is required for PI05")
+        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
+        if tasks is None:
+            raise ValueError("No task found in complementary data")
+        reasonings = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.reasoning_key)
+
+        state = deepcopy(state)
+        state = pad_vector(state, self.max_state_dim)
+        state_np = state.cpu().numpy()
+        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+
+        tok = self._get_tokenizer()
+        bos_id = tok.bos_token_id
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+
+        B = len(tasks)
+        all_tokens = np.full((B, self.max_length), pad_id, dtype=np.int64)
+        all_attn = np.zeros((B, self.max_length), dtype=bool)
+        all_ar = np.zeros((B, self.max_length), dtype=bool)
+        all_loss = np.zeros((B, self.max_length), dtype=bool)
+
+        for i, task in enumerate(tasks):
+            hl = task.strip().replace("_", " ").replace("\n", " ")
+            state_str = " ".join(map(str, discretized_states[i]))
+            sub = reasonings[i].strip() if (reasonings is not None and reasonings[i]) else ""
+
+            prefix_a_str = f"Task: {hl}. Subtask: "
+            tail_str = f". State: {state_str};\nAction: "
+
+            a_ids = tok(prefix_a_str, add_special_tokens=False)["input_ids"]
+            tail_ids = tok(tail_str, add_special_tokens=False)["input_ids"]
+            sub_ids = tok(sub, add_special_tokens=False)["input_ids"] if sub else []
+
+            # Compose: [BOS, prefix_a, subtask, tail]; truncate tail first if overflow.
+            n_real = 1 + len(a_ids) + len(sub_ids) + len(tail_ids)
+            if n_real > self.max_length:
+                excess = n_real - self.max_length
+                if excess <= len(tail_ids):
+                    tail_ids = tail_ids[: len(tail_ids) - excess]
+                else:
+                    # Pathological — drop tail entirely, then subtask end. Keeps prompt parseable.
+                    excess -= len(tail_ids)
+                    tail_ids = []
+                    sub_ids = sub_ids[: max(0, len(sub_ids) - excess)]
+                n_real = 1 + len(a_ids) + len(sub_ids) + len(tail_ids)
+
+            seq = [bos_id, *a_ids, *sub_ids, *tail_ids]
+            all_tokens[i, :n_real] = seq
+            all_attn[i, :n_real] = True
+
+            sub_start = 1 + len(a_ids)
+            sub_end = sub_start + len(sub_ids)
+            # AR mask: each subtask token is its own causal block; first tail token opens its own block.
+            all_ar[i, sub_start:sub_end] = True
+            if len(tail_ids) > 0:
+                all_ar[i, sub_end] = True
+            # Loss mask: supervise only subtask tokens.
+            all_loss[i, sub_start:sub_end] = True
+
+        obs = transition.get(TransitionKey.OBSERVATION, {}).copy()
+        obs[OBS_LANGUAGE_TOKENS] = torch.from_numpy(all_tokens)
+        obs[OBS_LANGUAGE_ATTENTION_MASK] = torch.from_numpy(all_attn)
+        obs[OBS_LANGUAGE_AR_MASK] = torch.from_numpy(all_ar)
+        obs[OBS_LANGUAGE_LOSS_MASK] = torch.from_numpy(all_loss)
+        transition[TransitionKey.OBSERVATION] = obs
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 def make_pi05_pre_post_processors(
     config: PI05Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -130,25 +250,41 @@ def make_pi05_pre_post_processors(
     """
 
     # Add remaining processors
-    input_steps: list[ProcessorStep] = [
+    base_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
-        # because the tokenizer step expects normalized state in [-1, 1] range for discretization
+        # NOTE: NormalizerProcessorStep MUST come before any Pi05*PrepareStateTokenizer* step
+        # because those expect normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
-        TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3b-pt-224",
-            max_length=config.tokenizer_max_length,
-            padding_side="right",
-            padding="max_length",
-        ),
-        DeviceProcessorStep(device=config.device),
     ]
+    if getattr(config, "predict_reasoning", False):
+        # Hierarchical reasoning: subsume the prepare+tokenize pair with a single step
+        # that emits AR / loss masks alongside the token ids.
+        input_steps: list[ProcessorStep] = [
+            *base_steps,
+            Pi05ReasoningPrepareAndTokenizeStep(
+                tokenizer_name="google/paligemma-3b-pt-224",
+                max_length=config.tokenizer_max_length,
+                max_state_dim=config.max_state_dim,
+            ),
+            DeviceProcessorStep(device=config.device),
+        ]
+    else:
+        input_steps = [
+            *base_steps,
+            Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+            TokenizerProcessorStep(
+                tokenizer_name="google/paligemma-3b-pt-224",
+                max_length=config.tokenizer_max_length,
+                padding_side="right",
+                padding="max_length",
+            ),
+            DeviceProcessorStep(device=config.device),
+        ]
 
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(

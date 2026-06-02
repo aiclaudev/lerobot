@@ -632,9 +632,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
+        self, images, img_masks, tokens, masks, lang_ar_mask=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer."""
+        """Embed images with SigLIP and language tokens with embedding layer.
+
+        If `lang_ar_mask` (bool[B, num_lang]) is provided, the language portion of
+        att_masks is replaced by it (per-sample), enabling causal blocks within the
+        subtask region for hierarchical-reasoning training. Default behavior
+        (lang_ar_mask=None) is bit-exact unchanged.
+        """
         embs = []
         pad_masks = []
         att_masks = []
@@ -671,6 +677,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        if lang_ar_mask is not None:
+            # Override the trailing num_lang positions with per-sample mask.
+            # `expand` returns a non-contiguous view; clone before mutation.
+            att_masks = att_masks.clone()
+            att_masks[:, -num_lang_embs:] = lang_ar_mask.to(
+                dtype=torch.bool, device=att_masks.device
+            )
 
         return embs, pad_masks, att_masks
 
@@ -721,8 +735,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss."""
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        lang_ar_mask=None,
+        lang_loss_mask=None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Do a full training forward pass and compute the loss.
+
+        Returns
+        -------
+        mse_per_element : Tensor [B, chunk, max_action_dim]
+            Per-element flow-matching MSE (existing return semantics).
+        ce_loss : Tensor (scalar) or None
+            Per-token-averaged CE on supervised reasoning positions.
+            None when `lang_loss_mask` is None or all-zero (existing path).
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -733,7 +767,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, tokens, masks, lang_ar_mask=lang_ar_mask
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -751,8 +787,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
+        # Whether we need prefix_out for CE supervision (cheaper to keep flag than recompute).
+        need_prefix_out = lang_loss_mask is not None and bool(lang_loss_mask.any().item())
+
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -760,11 +799,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
+            if need_prefix_out:
+                return prefix_out, suffix_out
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
+        if need_prefix_out:
+            prefix_out, suffix_out = out
+        else:
+            prefix_out, suffix_out = None, out
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -773,8 +818,73 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             return self.action_out_proj(suffix_out)
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        mse = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        ce_loss: Tensor | None = None
+        if need_prefix_out:
+            num_lang_tokens = tokens.shape[1]
+            num_img_tokens = prefix_out.shape[1] - num_lang_tokens
+            ce_loss = self._compute_reasoning_ce_loss(
+                prefix_out, tokens, lang_loss_mask, num_img_tokens, num_lang_tokens
+            )
+
+        return mse, ce_loss
+
+    def _lm_head_logits(self, hidden: Tensor) -> Tensor:
+        """Project hidden states to vocab logits via PaliGemma's tied LM head.
+
+        PaliGemma's GemmaModel exposes `embed_tokens` (input embedding); the
+        output LM head is tied to those weights (standard Gemma, matches
+        LisavilaLee/openpi_with_subtask's `embedder.decode`). We project as
+        `F.linear(x, embed_tokens.weight)` which is equivalent to
+        `x @ embed_tokens.weight.T`. Always works regardless of how the
+        wrapper exposes (or hides) the .lm_head attribute.
+
+        Applies Gemma2's final-logit softcap if configured (None for Gemma 1
+        PaliGemma).
+        """
+        embed_tokens = self.paligemma_with_expert.paligemma.language_model.embed_tokens
+        weight = embed_tokens.weight
+        # F.linear requires matching dtypes — match the (bf16) weight here, then
+        # promote logits to float32 below for numerically-stable log_softmax/CE.
+        logits = F.linear(hidden.to(weight.dtype), weight)
+        softcap = getattr(
+            getattr(self.paligemma_with_expert.paligemma.config, "text_config", None),
+            "final_logit_softcapping",
+            None,
+        )
+        if softcap is not None:
+            logits = torch.tanh(logits / softcap) * softcap
+        return logits.to(torch.float32)
+
+    def _compute_reasoning_ce_loss(
+        self,
+        prefix_out: Tensor,
+        tokens: Tensor,
+        loss_mask: Tensor,
+        num_img_tokens: int,
+        num_lang_tokens: int,
+    ) -> Tensor:
+        """Token-averaged CE on supervised language positions.
+
+        AR shift: hidden at position i predicts token at i+1. We slice the
+        language portion of `prefix_out` from index 0..num_lang-2 (the
+        predictors) and align against `tokens[:, 1:]` (the targets) with
+        `loss_mask[:, 1:]` as the supervision indicator.
+        """
+        text_hidden = prefix_out[
+            :, num_img_tokens : num_img_tokens + num_lang_tokens - 1, :
+        ].to(torch.float32)
+        logits = self._lm_head_logits(text_hidden)  # [B, num_lang-1, V]
+
+        targets = tokens[:, 1:]  # [B, num_lang-1]
+        mask = loss_mask[:, 1:].to(dtype=torch.float32)  # [B, num_lang-1]
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        nll = -log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+        masked = nll * mask
+        denom = mask.sum().clamp(min=1.0)
+        return masked.sum() / denom
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1247,26 +1357,50 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Hierarchical reasoning extras (present only when the reasoning processor ran).
+        lang_ar_mask = batch.get("observation.language.ar_mask")
+        lang_loss_mask = batch.get("observation.language.loss_mask")
+
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        mse_losses, ce_loss = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            lang_ar_mask=lang_ar_mask,
+            lang_loss_mask=lang_loss_mask,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        mse_losses = mse_losses[:, :, :original_action_dim]
 
         loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "loss_per_dim": mse_losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 
+        lambda_ce = getattr(self.config, "reasoning_loss_weight", 1.0)
+
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            # Return per-sample losses (B,) by averaging over time and action dims.
+            # CE is a scalar (per-token avg over the whole batch); add it uniformly.
+            per_sample_loss = mse_losses.mean(dim=(1, 2))
+            if ce_loss is not None:
+                per_sample_loss = per_sample_loss + lambda_ce * ce_loss
+                loss_dict["ce_loss"] = ce_loss.item()
+            loss_dict["mse_loss"] = mse_losses.mean().item()
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+            # Default: scalar mean loss.
+            mse_scalar = mse_losses.mean()
+            loss_dict["mse_loss"] = mse_scalar.item()
+            total = mse_scalar
+            if ce_loss is not None:
+                total = total + lambda_ce * ce_loss
+                loss_dict["ce_loss"] = ce_loss.item()
+            loss_dict["loss"] = total.item()
+            return total, loss_dict

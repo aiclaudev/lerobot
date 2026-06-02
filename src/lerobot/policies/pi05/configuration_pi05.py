@@ -96,6 +96,16 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    # ── Hierarchical reasoning (PI's HL mode, see docs/plan/pi05_reasoning.md) ──
+    # Master switch. False → bit-exact existing PI0.5 behavior.
+    predict_reasoning: bool = False
+    # CE loss weight on reasoning tokens. Total = MSE(action) + λ·CE(reasoning).
+    reasoning_loss_weight: float = 1.0
+    # Max tokens generated during inference AR decode of the subtask string.
+    reasoning_max_tokens: int = 64
+    # Decode stops as soon as this string is generated as a single token (or eos).
+    reasoning_stop_token: str = "."
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -107,6 +117,11 @@ class PI05Config(PreTrainedConfig):
 
         if self.paligemma_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid paligemma_variant: {self.paligemma_variant}")
+
+        if self.predict_reasoning and self.reasoning_loss_weight < 0:
+            raise ValueError(
+                f"reasoning_loss_weight must be >= 0, got {self.reasoning_loss_weight}"
+            )
 
         if self.action_expert_variant not in ["gemma_300m", "gemma_2b"]:
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
